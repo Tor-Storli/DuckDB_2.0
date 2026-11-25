@@ -1,0 +1,11 @@
+ggsql
+---------
+
+DuckDB v1.5.4 (Variegata)
+Enter ".help" for usage hints.
+memory D INSTALL ggsql FROM community;
+memory D LOAD ggsql;
+
+In Explorer
+-----------
+C:\Users\storl\.duckdb\extensions\v1.5.4\windows_amd64

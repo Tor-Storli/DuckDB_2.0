@@ -1,0 +1,499 @@
+
+------------------------------------------------------------
+-- 0. SETUP: derived objects used by the demos
+------------------------------------------------------------
+.open 'C:\Users\storl\Desktop\SQL_Dialects.db';
+
+-- NEW CLI dot command in 2.0: signatures + examples
+.manual list_transform 
+
+CREATE OR REPLACE TABLE watchlist (ticker VARCHAR);
+INSERT INTO watchlist VALUES ('GIS'), ('HSY'), ('ZZZ');   -- ZZZ doesn't exist in your data
+
+CREATE OR REPLACE TABLE zscore_inputs
+(ticker VARCHAR, 
+ period_end DATE, 
+ ebit DOUBLE, 
+ revenue DOUBLE, 
+ retained_earnings DOUBLE, 
+ total_liabilities DOUBLE,
+ ebit_margin DOUBLE
+ );
+
+INSERT INTO zscore_inputs
+SELECT ticker, period_end, ebit, revenue, retained_earnings, total_liabilities,
+       ebit / revenue AS ebit_margin
+FROM read_json('c:/tmp/zscore_inputs.json');
+
+CREATE OR REPLACE VIEW v_margin AS
+SELECT ticker, period_end, ebit, revenue, retained_earnings, total_liabilities,
+       ebit / revenue AS ebit_margin
+FROM zscore_inputs;
+
+
+------------------------------------------------------------
+-- 1. $variable shorthand (replaces getvariable('x'))
+------------------------------------------------------------
+SET VARIABLE min_margin = 0.20;
+SELECT ticker, period_end,
+       round(ebit_margin, 3) AS margin
+FROM v_margin
+WHERE ebit_margin > $min_margin
+ORDER BY margin DESC
+LIMIT 5;
+
+SELECT $min_margin = getvariable('min_margin') AS same;   -- true
+SELECT $undefined_var;     -- ERROR (getvariable would return NULL instead)
+
+------------------------------------------------------------
+-- 2. SQL-standard FETCH FIRST / FETCH NEXT
+------------------------------------------------------------
+SELECT ticker, period_end, round(ebit_margin, 3) AS margin
+FROM v_margin WHERE ebit_margin IS NOT NULL
+ORDER BY margin DESC;
+
+SELECT ticker, period_end, round(ebit_margin, 3) AS margin
+FROM v_margin WHERE ebit_margin IS NOT NULL
+ORDER BY margin DESC
+FETCH FIRST 5 ROWS ONLY;
+
+SELECT ticker, period_end, round(ebit_margin, 3) AS margin    -- paging
+FROM v_margin WHERE ebit_margin IS NOT NULL
+ORDER BY margin DESC
+OFFSET 5 ROWS FETCH NEXT 2 ROWS ONLY;
+
+SELECT  ticker, period_end, round(ebit_margin, 3) AS margin  
+FROM v_margin 
+WHERE ebit_margin IS NOT NULL
+ ORDER BY margin DESC 
+ FETCH FIRST ROW ONLY; 
+ 
+-- THIS IS CREATING AN ERROR, NO FETCH LAST ROW AVAILABLE
+SELECT  ticker, period_end, round(ebit_margin, 3) AS margin  
+FROM v_margin 
+WHERE ebit_margin IS NOT NULL
+ ORDER BY margin DESC 
+ FETCH LAST ROW ONLY; 
+
+------------------------------------------------------------
+-- 3. Python-style lambdas (single arrow is now OFF by default)
+------------------------------------------------------------
+
+-- Stage 1: GROUP BY turns many rows into one list per ticker
+-- GROUP BY ticker collapses all rows for a company into one row. 
+-- list(...) is an aggregate function that gathers values into a single list. 
+-- The ORDER BY period_end inside the parentheses sorts the values oldest to newest 
+-- before they go in the list. Without it, the order isn’t guaranteed.
+
+SELECT ticker, list(ebit ORDER BY period_end) AS ebit_list
+FROM zscore_inputs
+GROUP BY ticker;
+
+-----------------------------------------------------------
+
+--- HSY
+SELECT (1782698000.0 +2043722000.0 + 2260787000.0 
++ 2560867000.0 + 2898232000.0 + 1441528000.0) AS Total;
+
+-- Stage 2: three list functions, each given a small lambda
+
+-- A lambda is a tiny inline function. The 2.0 syntax is lambda 
+-- parameter : expression, written like Python. 
+-- The old x -> x + 1 arrow style is disabled by default in 2.0.
+
+-- 1) list_transform applies the lambda to every element and returns 
+--    a new list of the same length. Here round(x/1e9, 2) converts raw dollars to billions.
+
+-- 2) list_reduce folds the list into a single value. 
+--    The lambda takes two arguments: a is the running result and b is the next element. 
+--    Here a + b is a running sum.
+
+-- 3) list_filter keeps only the elements for which the lambda returns true. 
+--    The lambda takes x (the value) and i (its 1-based position). 
+--    x > 1e9 AND i > 1 means “over $1B, and not the first element”.
+
+-- A step-by-step example
+WITH per_ticker AS (
+  SELECT ticker, list(ebit ORDER BY period_end) AS ebits
+  FROM zscore_inputs
+  GROUP BY ticker
+)
+SELECT ticker,
+       ebits,                                                          -- the raw list
+       list_transform(ebits, lambda x : round(x/1e9, 2)) AS ebit_bn,   -- reshape each element
+       list_reduce(ebits, lambda a, b : a + b)           AS ebit_total,-- collapse to one value
+       list_filter(ebits, lambda x, i : x > 1e9 AND i > 1) AS big_after_first
+FROM per_ticker;
+
+
+SELECT list_transform([1,2,3], x -> x + 1);                  -- ERROR in 2.0 (breaking change)
+SET lambda_syntax = 'enable_single_arrow';                    -- temporary escape hatch (removed in 2.1)
+
+SELECT list_transform([1,2,3], x -> x + 1);
+SET lambda_syntax = 'default';
+
+------------------------------------------------------------
+-- 4. GROUP BY UNNEST
+------------------------------------------------------------
+-- This is a two-step “flagging” pattern. The first query tags 
+-- each filing with the red flags that apply to it, and the 
+-- second counts how often each flag appears across all filings.
+
+--Step A: four CASE expressions, each of which may be NULL.
+--  CASE WHEN revenue IS NULL THEN 'missing_revenue' END
+--  There’s no ELSE, so a CASE expression returns NULL 
+--  when its condition isn’t met. For each row, every CASE 
+--  either returns a flag name or returns NULL.
+
+--Step B: the square brackets build a list from those four values.
+-- ['missing_revenue', NULL, NULL, 'high_leverage']   -- example: 2 of 4 conditions hit
+
+-- The list always has four slots, and the slots with no flag hold NULL.
+
+--Step C: list_filter removes the NULL slots.
+-- list_filter([...], lambda f : f IS NOT NULL)
+
+-- The lambda gets each element as f and keeps it if f IS NOT NULL is true. 
+-- The result for the example above:
+-- ['missing_revenue', 'high_leverage']
+
+-- A filing with no problems ends up with an empty list, [].
+
+-- CREATE OR REPLACE TABLE flagged AS ... saves the result. 
+-- We get one row per filing, with a flags column that holds 
+-- a list of strings of varying length.
+
+--Part 2: counting flags with GROUP BY unnest
+
+{sql} 
+SELECT unnest(flags) AS flag, count(*) AS n
+FROM flagged
+GROUP BY unnest(flags)
+ORDER BY n DESC;
+
+-- unnest(flags) explodes each list into separate rows, one per flag. 
+-- The filing from above becomes two rows, one with missing_revenue 
+-- and one with high_leverage. Then GROUP BY counts each flag name.
+
+-- This is the 2.0 addition. Before 2.0, you couldn’t put unnest directly in GROUP BY. 
+-- You had to unnest in a subquery and group the outer query:
+
+{sql}
+-- the pre-2.0 workaround
+SELECT flag, count(*) AS n
+FROM (SELECT unnest(flags) AS flag FROM flagged)
+GROUP BY flag;
+
+-- What we should understand about the output
+-- n counts flags, not filings. 
+-- A filing with two flags is counted once under each flag, 
+-- so the totals add up to more than the number of filings.
+-- Clean filings disappear. An empty list unnests to zero rows, 
+-- so only filings with at least one flag contribute.
+
+
+
+CREATE OR REPLACE TABLE flagged AS
+SELECT ticker, period_end,
+       list_filter([
+         CASE WHEN revenue IS NULL THEN 'missing_revenue' END,
+         CASE WHEN ebit_margin < 0.05 THEN 'thin_margin' END,
+         CASE WHEN retained_earnings < 0 THEN 'negative_re' END,
+         CASE WHEN total_liabilities > 3 * retained_earnings THEN 'high_leverage' END
+       ], lambda f : f IS NOT NULL) AS flags
+FROM v_margin;
+
+SELECT unnest(flags) AS flag, count(*) AS n
+FROM flagged
+GROUP BY unnest(flags)
+ORDER BY n DESC;
+
+------------------------------------------------------------
+-- 5. Explicit join types: JOIN BY (TYPE ...)
+------------------------------------------------------------
+
+-- 1) Semi joins return rows from the left table that have at least one match in the right table. 
+-- 2) Anti joins return rows from the left table that have no matches in the right table. 
+
+--	  When using a semi or anti join the result will never have more rows than the left hand side table. 
+--    Semi joins provide the same logic as the IN operator statement. 
+--    Anti joins provide the same logic as the NOT IN operator, 
+--    except anti joins ignore NULL values from the right table.
+
+| Join type | Description |
+|:----------|:------------|
+| `inner` | Inner join. |
+| `left` | Left outer join. |
+| `right` | Right outer join. |
+| `full` | Full outer join. |
+| `semi` | Semi join: returns the rows of the left side that have a match. |
+| `anti` | Anti join: returns the rows of the left side that have no match. |
+| `right_semi` | Returns the rows of the right side that have a match. |
+| `right_anti` | Returns the rows of the right side that have no match. |
+| `mark` | Returns all rows of the left side along with a `BOOLEAN` column `__mark_join_marker`, which has the same three-valued result as an `IN` expression. |
+| `single` | Returns all rows of the left side paired with their matching row from the right side (or `NULL` if there is no match). Similarly to scalar subqueries, it throws an error if a left row has more than one match (see the `scalar_subquery_error_on_multiple_rows` setting). |
+
+*Source: [DuckDB Documentation, "FROM and JOIN Clauses: Specifying the Join Type Explicitly"](https://duckdb.org/docs/2.0/sql/query_syntax/from#specifying-the-join-type-explicitly)*
+
+CREATE OR REPLACE TABLE watchlist (ticker VARCHAR);
+INSERT INTO watchlist VALUES ('GIS'), ('HSY'), ('ZZZ');   -- ZZZ doesn't exist in your data
+
+-- semi: filings whose ticker is on the watchlist (no duplication)
+SELECT z.ticker, z.period_end FROM zscore_inputs z
+JOIN BY (TYPE semi) watchlist w ON (z.ticker = w.ticker);
+
+-- anti: filings NOT on the watchlist
+SELECT DISTINCT z.ticker FROM zscore_inputs z
+JOIN BY (TYPE anti) watchlist w ON (z.ticker = w.ticker);
+
+-- right_anti: watchlist entries with no data
+SELECT w.ticker FROM zscore_inputs z
+JOIN BY (TYPE right_anti) watchlist w ON (z.ticker = w.ticker);
+
+-- mark: every row, plus a boolean marker (like IN)
+SELECT z.ticker, z.period_end, __mark_join_marker AS on_watchlist
+FROM zscore_inputs z
+JOIN BY (TYPE mark) watchlist w ON (z.ticker = w.ticker)
+ORDER BY z.ticker, z.period_end LIMIT 10;
+
+------------------------------------------------------------
+-- 6. NEAREST / APPROX NEAREST joins: "who are GIS's closest peers?"
+--    (ratios have different scales; normalize them for a real analysis)
+------------------------------------------------------------
+-- A nearest join matches each left side row with the top-k right side rows 
+-- according to a similarity or distance measure. 
+-- This turns top-k similarity search into a join clause, which is handy for 
+-- vector and embedding workloads.
+
+-- The join is written as NEAREST k BY SIMILARITY expression (higher is closer) 
+-- or NEAREST k BY DISTANCE expression (lower is closer). 
+-- Prefixing it with APPROX performs an approximate search, which can be faster for large inputs:
+
+-- The pattern: JOIN <table> NEAREST k BY DISTANCE <distance expression>. 
+-- For each left-side row, DuckDB finds the k right-side rows with the smallest distance.
+-- No ON clause: the distance expression decides the match.
+-- k is how many matches per row: with NEAREST 2, every customer appears twice.
+-- DISTANCE vs SIMILARITY: with DISTANCE, a smaller number means closer. 
+-- With BY SIMILARITY, a bigger number means closer, for example array_cosine_similarity.
+
+-- 1. Tiny data: 3 stores and 3 customers, each with an (x, y) location
+CREATE OR REPLACE TABLE stores (store VARCHAR, loc FLOAT[2]);
+INSERT INTO stores VALUES
+  ('A', [1, 1]::FLOAT[2]),
+  ('B', [5, 1]::FLOAT[2]),
+  ('C', [3, 4]::FLOAT[2]);
+
+CREATE OR REPLACE TABLE customers (customer VARCHAR, loc FLOAT[2]);
+INSERT INTO customers VALUES
+  ('Ann', [1, 2]::FLOAT[2]),
+  ('Bob', [4, 2]::FLOAT[2]),
+  ('Cy',  [2, 5]::FLOAT[2]);
+
+-- 2. NEAREST 1: each customer's closest store
+SELECT c.customer, s.store,
+       round(array_distance(c.loc, s.loc), 2) AS distance
+FROM customers c
+JOIN stores s NEAREST 1 BY DISTANCE array_distance(c.loc, s.loc);
+-- Ann -> A (1.0)   Bob -> B (1.41)   Cy -> C (1.41)
+
+-- 3. Change one number: NEAREST 2 gives each customer their two closest stores
+SELECT c.customer, s.store,
+       round(array_distance(c.loc, s.loc), 2) AS distance
+FROM customers c
+JOIN stores s NEAREST 2 BY DISTANCE array_distance(c.loc, s.loc)
+ORDER BY c.customer, distance;
+-- 6 rows: each customer shows up twice, once per neighbor
+
+-- Before 2.0, you had to compute every pair, rank them and keep 
+-- the top k. Here is the old way for comparison:
+
+{sql}
+SELECT customer, store, round(dist, 2) AS distance
+FROM (
+  SELECT c.customer, s.store, array_distance(c.loc, s.loc) AS dist,
+         row_number() OVER (PARTITION BY c.customer ORDER BY array_distance(c.loc, s.loc)) AS rn
+  FROM customers c CROSS JOIN stores s
+)
+WHERE rn = 1;
+
+------------------------------------------------------------
+-- 7. Data-modifying CTEs
+------------------------------------------------------------
+CREATE OR REPLACE TABLE staging AS FROM zscore_inputs WHERE revenue IS NULL;
+CREATE OR REPLACE TABLE archive AS FROM zscore_inputs LIMIT 0;
+
+-- Move rows: DELETE ... RETURNING feeds an INSERT, in ONE statement
+WITH moved AS MATERIALIZED (
+  DELETE FROM staging RETURNING *
+)
+INSERT INTO archive SELECT * FROM moved;
+
+SELECT (SELECT count(*) FROM staging) AS left_in_staging,
+       (SELECT count(*) FROM archive) AS in_archive;
+
+-- UPDATE inside a CTE, read the result in the main query
+CREATE OR REPLACE TABLE work AS FROM zscore_inputs;
+WITH updated AS (
+  UPDATE work SET ebit = ebit * 1.05 WHERE ticker = 'GIS' RETURNING *
+)
+SELECT count(*) AS rows_updated, round(avg(ebit)) AS avg_new_ebit FROM updated;
+
+------------------------------------------------------------
+-- 8. MERGE INTO: defined semantics for duplicate source matches
+------------------------------------------------------------
+CREATE OR REPLACE TABLE m_target AS
+  SELECT ticker, period_end, ebit, revenue FROM zscore_inputs WHERE ticker IN ('GIS','HSY');
+CREATE OR REPLACE TABLE m_source (ticker VARCHAR, period_end DATE, ebit DOUBLE, revenue DOUBLE);
+INSERT INTO m_source VALUES
+  ('HSY', '2024-12-31', 3.0e9, 11.3e9),      -- matches an existing HSY row
+  ('HSY', '2026-12-31', 3.2e9, 11.9e9);      -- new period
+
+MERGE INTO m_target t
+USING m_source s ON (t.ticker = s.ticker AND t.period_end = s.period_end)
+WHEN MATCHED THEN UPDATE SET ebit = s.ebit, revenue = s.revenue
+WHEN NOT MATCHED THEN INSERT BY NAME
+RETURNING merge_action, *;
+
+-- Duplicate source rows for ONE target row: MERGE now errors...
+INSERT INTO m_source VALUES ('HSY', '2024-12-31', 9.9e9, 9.9e9);
+MERGE INTO m_target t
+USING m_source s ON (t.ticker = s.ticker AND t.period_end = s.period_end)
+WHEN MATCHED THEN UPDATE SET ebit = s.ebit;
+-- Error: MERGE INTO command cannot affect the same target row more than once.
+
+-- ...while UPDATE ... FROM silently picks ONE arbitrary matching source row
+UPDATE m_target t SET ebit = s.ebit
+FROM m_source s WHERE t.ticker = s.ticker AND t.period_end = s.period_end;
+
+------------------------------------------------------------
+-- 9. WITH RECURSIVE ... USING KEY
+------------------------------------------------------------
+-- docs example: payload aggregate per key (a=1, b=2.5)
+WITH RECURSIVE tbl(a, b) USING KEY (a, avg(b)) AS (
+  SELECT 1, 5
+  UNION ALL
+  SELECT a, b - 1 FROM tbl WHERE b > 0
+)
+TABLE tbl;
+
+-- finance flavor: compound $100 for 5 steps at each ticker's avg margin.
+-- USING KEY (ticker) means each step OVERWRITES the ticker's row,
+-- so the result is one final row per ticker, not 6 rows per ticker.
+CREATE OR REPLACE TABLE avg_margin AS
+  SELECT ticker, avg(ebit_margin) AS m FROM v_margin GROUP BY ticker;
+
+WITH RECURSIVE proj(ticker, step, value) USING KEY (ticker) AS (
+  SELECT ticker, 0, 100.0 FROM avg_margin
+  UNION ALL
+  SELECT p.ticker, p.step + 1, p.value * (1 + a.m)
+  FROM proj p JOIN avg_margin a USING (ticker)
+  WHERE p.step < 5
+)
+SELECT ticker, step, round(value, 2) AS value FROM proj ORDER BY ticker;
+
+------------------------------------------------------------
+-- 10. Nested schemas
+------------------------------------------------------------
+CREATE SCHEMA IF NOT EXISTS finance;
+CREATE SCHEMA IF NOT EXISTS finance.reports;
+CREATE OR REPLACE TABLE finance.reports.margins AS SELECT * FROM v_margin;
+SELECT count(*) FROM finance.reports.margins;
+SELECT * FROM duckdb_schemas() WHERE schema_name LIKE 'report%';
+
+------------------------------------------------------------
+-- 11. JSON mutation functions (the value argument is JSON text)
+------------------------------------------------------------
+-- The following scalar functions modify a JSON document at a 
+-- given path and return the updated document. The value argument 
+-- is a JSON value given as JSON text, e.g., '2' for the number 2 
+-- or '"duck"' for the string duck.
+
+
+WITH j AS (
+  SELECT to_json({'ticker': ticker, 'ebit': ebit}) AS doc FROM zscore_inputs LIMIT 1
+)
+SELECT doc,
+       json_set(doc,     '$.rating', '"watch"')  AS added_or_overwritten,
+       json_insert(doc,  '$.ebit',   '0')        AS insert_keeps_existing,
+       json_replace(doc, '$.rating', '"x"')      AS replace_ignores_missing,
+       json_remove(doc,  '$.ebit')               AS removed
+FROM j;
+
+-- ...then straight into VARIANT (ties back to the VARIANT video)
+SELECT json_set(to_json({'ticker': ticker, 'ebit': ebit}), '$.source', '"edgar"')::VARIANT AS v
+FROM zscore_inputs LIMIT 3;
+
+------------------------------------------------------------
+-- 12. SECURE VIEW (doesn't leak via stats or plans)
+------------------------------------------------------------
+CREATE OR REPLACE VIEW normal_v AS
+  SELECT ticker, ebit FROM zscore_inputs WHERE ticker = 'GIS';
+CREATE OR REPLACE SECURE VIEW secure_v AS
+  SELECT ticker, ebit FROM zscore_inputs WHERE ticker = 'GIS';
+
+SELECT stats(ticker) FROM normal_v LIMIT 1;    -- leaks the filtered range
+SELECT stats(ticker) FROM secure_v LIMIT 1;    -- uninformative
+EXPLAIN ANALYZE SELECT * FROM secure_v;        -- single "Secure View" node
+
+------------------------------------------------------------
+-- 13. SHOW changes
+------------------------------------------------------------
+SHOW zscore_inputs;               -- deprecated for tables, prints a warning, use DESCRIBE
+DESCRIBE zscore_inputs;
+SET threads = 4;
+SHOW threads;                     -- settings still work
+SHOW DATABASES;
+SHOW SCHEMAS;
+SET show_behavior = 'table';      -- 'auto' (default) | 'table' | 'setting'
+SET show_behavior = 'auto';
+
+------------------------------------------------------------
+-- 14. setval(): set a sequence value
+------------------------------------------------------------
+CREATE OR REPLACE SEQUENCE filing_id START 1;
+SELECT setval('filing_id', 42);           -- next nextval = 43
+SELECT nextval('filing_id');
+SELECT setval('filing_id', 100, false);   -- is_called=false: next nextval = 100
+SELECT nextval('filing_id');
+
+------------------------------------------------------------
+-- 15. regexp_extract with options (no group argument)
+------------------------------------------------------------
+SELECT ticker, regexp_extract(lower(ticker), 'GIS', 'i') AS ci_match
+FROM zscore_inputs WHERE ticker = 'GIS' LIMIT 1;     -- returns 'gis'
+
+-- Breaking-change segment
+-- Single-arrow lambdas: x -> x + 1 is off by default in 2.0 and removed in 2.1. 
+-- Section 3 shows the error and the lambda_syntax setting.
+-- New PEG parser: it is now the default and replaces the Postgres-derived one. 
+-- You can switch back with SET enable_legacy_parser = true; 
+-- using the legacy_parser extension. 
+-- Error messages now include source locations. 
+-- A deliberately malformed query makes a good demo.
+
+-- MERGE and UPDATE ... FROM: semantics for multiple matching source rows 
+-- are now defined. MERGE errors and UPDATE ... FROM picks one arbitrary row, as section 8 shows.
+-- Things to watch when you run it
+-- WHEN NOT MATCHED THEN INSERT BY NAME (section 8): the docs list 
+-- INSERT with optional BY NAME, but I didn’t see the full grammar. 
+-- If it errors, try INSERT VALUES (s.ticker, ...).
+
+-- Nearest joins (section 6): the docs show NEAREST k BY DISTANCE and APPROX NEAREST k BY SIMILARITY. I used subqueries on both sides, which should work but is not shown there.
+Secure view (section 12): the output of stats() and EXPLAIN ANALYZE is described in the docs only loosely, so check what you actually see on screen before narrating it.
+Triggers and MERGE: MERGE INTO isn’t supported on tables that have triggers (see the trigger gotchas). The demo tables here have none, so it’s fine.
+Left out:
+COPY ... TO blocks inside CTEs. The docs link is there, but I couldn’t confirm the exact form.
+OVERLAY(), which only appeared in the preview post.
+Extension repositories, CONNECT/quack_serve (the server story), and session variables as prepared-statement defaults.
+The PEG parser’s extension hooks. I’d cover these in separate segments.
+
+Sources:
+
+Announcing DuckDB 2.0.0 LTS “Cinnamon Teal”
+A Preview of DuckDB v2.0
+What’s New in the Docs for 2.0
+FROM and JOIN syntax (2.0)
+WITH clause (2.0)
+MERGE INTO (2.0)
+SET VARIABLE (2.0)
+Gems of DuckDB 2.0.0

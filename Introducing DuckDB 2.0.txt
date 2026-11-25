@@ -1,0 +1,233 @@
+Introducing DuckDB 2.0
+
+
+
+In this Part 2 video, we will take a look at some of the features in the new DuckDB 2.0.0 release.
+
+
+
+
+-- This will NOT work. Cannot mix CLI commands with SQL commands:
+COPY .dump TO "c:/tmp/dump.sql";
+
+-- This will work:
+-- EXPORT DATABASE 'c:/tmp/dump' (FORMAT PARQUET);
+
+
+
+--VARIANT Data Type
+
+-- https://duckdb.org/docs/2.0/sql/data_types/variant
+-- https://duckdb.org/docs/2.0/sql/functions/variant
+-- ==============================================
+-- COPY (SELECT ticker, period_end, total_liabilities, retained_earnings, ebit, revenue FROM zscore_inputs) TO 'c:/tmp/zscore_inputs.json';
+
+-- 1. Attach the old DB and a NEW file with the latest storage version
+----------------------------------------------------------------------
+-- ATTACH 'C:/Users/storl/Desktop/Earnings_Analysis/financials.db' AS old_fin;          -- use your real file name
+-- ATTACH 'C:/Users/storl/Desktop/Earnings_Analysis/financials_v2.db' AS fin2 (STORAGE_VERSION 'latest');
+
+-- 2. Copy everything (tables, views, etc.)
+-- COPY FROM DATABASE old_fin TO fin2;
+
+-- 3. Confirm the new version
+-- SELECT database_name, tags FROM duckdb_databases();
+
+
+-- Close CLI
+-------------
+-- Rename old financials.db to financials_v152.db in the 'C:\Users\storl\Desktop\Earnings_Analysis' folder
+-- Rename new financials_v2.db to financials.db
+
+--================================================
+-- START UP NEW CLI Shell
+--================================================
+
+-- 1. Work in the new financial.db storage version
+--------------------------------------------------
+.open 'C:\Users\storl\Desktop\Earnings_Analysis\financials.db';
+
+-- 2. Confirm the new version
+SELECT database_name, tags FROM duckdb_databases();
+
+CREATE OR REPLACE TABLE zscore_variant (id INTEGER, data VARIANT);
+
+-- Insert data from JSON File
+-----------------------------
+
+INSERT INTO zscore_variant
+SELECT row_number() OVER ()::INTEGER AS id,
+       json::VARIANT              AS data
+FROM read_json_objects('c:/tmp/zscore_inputs.json');
+
+-- View Results
+SELECT * FROM zscore_variant LIMIT 3;
+
+--3. Inspect types
+--   JSON null should come back as a null type instead of a number, and dates arrive as strings.
+
+SELECT id,
+       variant_type(data)             AS top_type,    -- OBJECT
+       variant_typeof(data)           AS full_type,   -- OBJECT(ebit, period_end, ...)
+       variant_typeof(data.revenue)   AS revenue_type,
+       variant_typeof(data.ebit)      AS ebit_type,
+       variant_typeof(data.period_end) AS date_type   -- VARCHAR, not DATE
+FROM zscore_variant;
+
+-- 4. Extract fields three ways
+ FROM zscore_variant;
+
+SELECT data.ticker                                  AS dot_notation,     -- VARIANT
+       variant_extract(data, 'ticker')              AS fn_extract,       -- VARIANT
+       variant_extract_string(data, 'ticker')       AS as_varchar,       -- VARCHAR
+       variant_extract_string(data, 'period_end')::DATE AS period_end,
+       (data.revenue)::DOUBLE                       AS revenue,
+       (data.ebit)::DOUBLE / (data.revenue)::DOUBLE AS ebit_margin
+FROM zscore_variant
+ORDER BY ebit_margin DESC NULLS LAST;
+
+-- 5. Introspect and check keys
+SELECT variant_keys(data)               AS keys,
+       variant_exists(data, 'revenue')  AS has_revenue_key,
+       variant_exists(data, 'foo')      AS has_foo_key
+FROM zscore_variant LIMIT 3;
+
+-- Rows where revenue is JSON null (the key exists, the value is null)
+SELECT id AS ID,
+       variant_extract_string(data,'ticker') AS ticker,
+       variant_extract_string(data,'period_end') AS period_end
+FROM zscore_variant
+WHERE variant_exists(data, 'revenue')
+  AND (data.revenue)::DOUBLE IS NULL;
+
+-- 6. Containment
+SELECT count(*) AS hsy_rows
+FROM zscore_variant
+WHERE variant_contains(data, '{"ticker": "HSY"}'::JSON::VARIANT);
+
+-- 7.Mixed shapes in one column
+--   This is the main reason to use VARIANT. A single column can hold objects, arrays, scalars and nulls, 
+--   and each row carries its own type.
+CREATE OR REPLACE TABLE variant_zoo (id INTEGER, v VARIANT);
+INSERT INTO variant_zoo VALUES
+  (1, 42::VARIANT),
+  (2, 'GIS'::VARIANT),
+  (3, [885800000.0, 3144800000.0, 2898232000.0]::VARIANT),
+  (4, {'ticker':'KHC','flags':['restated','missing_revenue']}::VARIANT),
+  (5, '{"ticker":"HSY","ebit":2898232000.0}'::JSON::VARIANT);
+
+-- 8. View data
+SELECT id, v,
+       variant_type(v)  AS kind,
+       variant_typeof(v) AS full_type,
+       CASE WHEN variant_type(v) = 'ARRAY' THEN variant_array_length(v) END AS arr_len,
+       v.ticker AS ticker_if_object
+FROM variant_zoo;
+
+
+-- 9. Build VARIANTs with the aggregates
+--    variant_group_array and variant_group_object roll rows up into nested documents.
+-- One document per ticker with an array of its filings
+
+CREATE OR REPLACE TABLE ticker_docs AS
+SELECT variant_extract_string(data,'ticker') AS ticker,
+       variant_group_array(
+         {'period_end': variant_extract_string(data,'period_end'),
+          'ebit':       (data.ebit)::DOUBLE,
+          'revenue':    (data.revenue)::DOUBLE}::VARIANT
+       ) AS filings
+FROM zscore_variant
+GROUP BY ticker;
+
+SELECT ticker, variant_array_length(filings) AS n_filings, filings
+FROM ticker_docs;
+
+-- One object per ticker, keyed by period_end
+SELECT variant_extract_string(data,'ticker') AS ticker,
+       variant_group_object(variant_extract_string(data,'period_end'),
+                            data.ebit) AS ebit_by_period
+FROM zscore_variant
+GROUP BY ticker;
+
+-- Window usage: running array of EBIT per ticker over time
+SELECT variant_extract_string(data,'ticker')     AS ticker,
+       variant_extract_string(data,'period_end') AS period_end,
+       variant_group_array(data.ebit) OVER (
+         PARTITION BY variant_extract_string(data,'ticker')
+         ORDER BY variant_extract_string(data,'period_end')
+       ) AS ebit_history
+FROM zscore_variant;
+
+-- 10. Normalize and compare
+--     Two documents with the same content but different key order or build method should 
+--     normalize to the same thing. variant_comparator gives a sort key.
+
+SELECT variant_normalize({'b': [1,2,3], 'a': 42}::VARIANT)
+     = variant_normalize('{"a":42,"b":[1,2,3]}'::JSON::VARIANT) AS same_after_normalize;
+
+-- Natural-type ordering (numbers by value, not by bytes)
+SELECT data.ticker, data.ebit
+FROM zscore_variant
+ORDER BY variant_comparator(data.ebit) DESC
+LIMIT 5;
+
+-- ==========================
+-- OPTIONAL - Try on your own
+-- ==========================
+-- 11. Generate large amount of data from financials.db to demonstrate shredding 
+--     Shredding only applies to row groups with at least 30,000 rows that share a 
+--     common structure. A synthetic table of a few million rows built to match our 
+--     schema fits that, and we can control the size. 
+--     It also lets us drop the SET variant_minimum_shredding_size.
+
+-- 30M synthetic filings
+.timer off
+SET preserve_insertion_order = false;   -- faster, lower memory for bulk COPY
+
+------------------------------------------------------------
+-- SHREDDING
+-- 1. Deterministic 30M-row source (plain columnar, small)
+------------------------------------------------------------
+CREATE OR REPLACE TABLE big_src AS
+SELECT
+  'T' || lpad((i % 600)::VARCHAR, 3, '0')                              AS ticker,
+  (DATE '1990-01-01' + INTERVAL ((i // 600) % 120 * 91) DAY)::DATE::VARCHAR AS period_end,
+  round((hash(i*7+1) % 50000000000) * 1.0, 2)                          AS total_liabilities,
+  round((hash(i*7+2) % 30000000000) * 1.0, 2)                          AS retained_earnings,
+  round((hash(i*7+3) %  5000000000) * 1.0, 2)                          AS ebit,
+  CASE WHEN hash(i*7+4) % 20 = 0 THEN NULL
+       ELSE round((hash(i*7+5) % 20000000000) * 1.0, 2) END            AS revenue
+FROM range(30000000) t(i);
+
+-- VARIANT view over it (nothing materialized)
+CREATE OR REPLACE VIEW big_variant AS
+SELECT i::INTEGER AS id,
+       {'ticker': ticker, 'period_end': period_end,
+        'total_liabilities': total_liabilities,
+        'retained_earnings': retained_earnings,
+        'ebit': ebit, 'revenue': revenue}::VARIANT AS data
+FROM (SELECT row_number() OVER () AS i, * FROM big_src);
+
+------------------------------------------------------------
+-- 2. Write two Parquet files: unshredded vs shredded
+------------------------------------------------------------
+SET variant_minimum_shredding_size = -1;          -- shredding off
+COPY big_variant TO 'c:/tmp/big_noshred.parquet' (FORMAT parquet);
+
+SET variant_minimum_shredding_size = 30000;       -- default
+COPY big_variant TO 'c:/tmp/big_shred.parquet'
+  (FORMAT parquet,
+   SHREDDING {'data': 'STRUCT(ticker VARCHAR, period_end VARCHAR, total_liabilities DOUBLE, retained_earnings DOUBLE, ebit DOUBLE, revenue DOUBLE)'});
+
+------------------------------------------------------------
+-- 3. Did shredding happen? How much smaller?
+-- Run it at least 4 times to remove any caching of data
+------------------------------------------------------------
+SELECT name, type FROM parquet_schema('c:/tmp/big_shred.parquet');
+SELECT name, type FROM parquet_schema('c:/tmp/big_noshred.parquet');
+
+SELECT 'noshred' AS f, round(sum(total_compressed_size)/1e6,1) AS mb
+FROM parquet_metadata('c:/tmp/big_noshred.parquet')
+UNION ALL
+SELECT 'shred', round(sum(total_compressed_size)/1e6,1)
+FROM parquet_metadata('c:/tmp/big_shred.parquet');
